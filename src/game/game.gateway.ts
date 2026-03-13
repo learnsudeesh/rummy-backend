@@ -7,21 +7,33 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 
+/* ================= CARD ================= */
+
+interface Card {
+  id: string; // A_♠_1
+  value: string; // A
+  suit: string; // ♠
+}
+
+/* ================= PLAYER ================= */
+
 interface Player {
   id: string;
   name: string;
-  hand: string[];
+  hand: Card[];
   hasDrawn: boolean;
 }
+
+/* ================= ROOM ================= */
 
 interface Room {
   players: Player[];
   hostId: string | null;
-  deck: string[];
-  openPile: string[];
+  deck: Card[];
+  openPile: Card[];
   currentTurnIndex: number;
   gameStarted: boolean;
-  suspenseJoker: string | null;
+  suspenseJoker: Card | null;
   pendingRummy: any;
   jokerUnlockedBy: string | null;
 }
@@ -44,7 +56,8 @@ export class GameGateway {
     jokerUnlockedBy: null,
   };
 
-  // ================= JOIN =================
+  /* ================= JOIN ================= */
+
   @SubscribeMessage('joinGame')
   join(
     @ConnectedSocket() client: Socket,
@@ -76,7 +89,8 @@ export class GameGateway {
     this.broadcast();
   }
 
-  // ================= START =================
+  /* ================= START ================= */
+
   @SubscribeMessage('startGame')
   start(@ConnectedSocket() client: Socket) {
     if (client.id !== this.room.hostId) return;
@@ -93,14 +107,17 @@ export class GameGateway {
     this.room.openPile = [this.room.deck.pop()!];
     this.room.currentTurnIndex = 0;
     this.room.gameStarted = true;
+
     this.room.suspenseJoker =
       this.room.deck[Math.floor(Math.random() * this.room.deck.length)];
+
     this.room.jokerUnlockedBy = null;
 
     this.broadcast();
   }
 
-  // ================= DRAW =================
+  /* ================= DRAW ================= */
+
   @SubscribeMessage('drawCard')
   draw(
     @ConnectedSocket() client: Socket,
@@ -110,7 +127,9 @@ export class GameGateway {
     if (!player || player.id !== client.id) return;
     if (player.hasDrawn) return;
 
-    if (data.from === 'deck' && this.room.deck.length === 0) this.reshuffle();
+    if (data.from === 'deck' && this.room.deck.length === 0) {
+      this.reshuffle();
+    }
 
     const card =
       data.from === 'deck' ? this.room.deck.pop() : this.room.openPile.pop();
@@ -123,28 +142,26 @@ export class GameGateway {
     this.broadcast();
   }
 
-  // ================= DROP =================
+  /* ================= DROP ================= */
+
   @SubscribeMessage('dropCard')
   drop(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { card: string },
+    @MessageBody() data: { cardId: string },
   ) {
     const player = this.getCurrent();
     if (!player || player.id !== client.id) return;
     if (!player.hasDrawn) return;
 
-    const i = player.hand.indexOf(data.card);
-    if (i === -1) return;
+    const index = player.hand.findIndex((c) => c.id === data.cardId);
+    if (index === -1) return;
 
-    player.hand.splice(i, 1);
-    this.room.openPile.push(data.card);
+    const droppedCard = player.hand.splice(index, 1)[0];
+    this.room.openPile.push(droppedCard);
     player.hasDrawn = false;
 
-    // ✅ If this player unlocked joker and now drops card
     if (this.room.jokerUnlockedBy === client.id) {
       this.server.to(client.id).emit('showJoker', this.room.suspenseJoker);
-
-      // Prevent multiple sends
       this.room.jokerUnlockedBy = null;
     }
 
@@ -152,36 +169,41 @@ export class GameGateway {
     this.broadcast();
   }
 
-  // ================= SHOW RUMMY =================
+  /* ================= SHOW RUMMY ================= */
+
   @SubscribeMessage('showRummy')
   show(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { cards: string[] },
+    @MessageBody() data: { cardIds: string[] },
   ) {
     const player = this.room.players.find((p) => p.id === client.id);
     if (!player) return;
+    if (!data.cardIds || data.cardIds.length !== 3) return;
 
-    if (!data.cards || data.cards.length !== 3) return;
-
-    // Check that selected cards exist in player's hand
-    const valid = data.cards.every((card) => player.hand.includes(card));
+    const valid = data.cardIds.every((id) =>
+      player.hand.some((c) => c.id === id),
+    );
 
     if (!valid) return;
+
+    const selectedCards = player.hand.filter((c) =>
+      data.cardIds.includes(c.id),
+    );
 
     this.room.pendingRummy = {
       playerId: player.id,
       playerName: player.name,
-      cards: data.cards,
+      cards: selectedCards,
     };
 
-    // Send ONLY to other players
     client.broadcast.to(this.ROOM).emit('rummyRequest', {
       playerName: player.name,
-      cards: data.cards,
+      cards: selectedCards,
     });
   }
 
-  // ================= VERIFY =================
+  /* ================= VERIFY ================= */
+
   @SubscribeMessage('verifyRummy')
   verify(
     @ConnectedSocket() client: Socket,
@@ -197,29 +219,45 @@ export class GameGateway {
       return;
     }
 
-    // ✅ Mark raiser as eligible to receive joker AFTER drop
     this.room.jokerUnlockedBy = raiserId;
-
-    // Just inform raiser approval happened
     this.server.to(raiserId).emit('rummyApproved');
 
     this.room.pendingRummy = null;
   }
 
-  // ================= COMPLETE =================
+  /* ================= COMPLETE ================= */
+
   @SubscribeMessage('completeGame')
-  complete(@ConnectedSocket() client: Socket) {
-    if (client.id !== this.room.jokerUnlockedBy) return;
+  complete(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { screenshot: string },
+  ) {
+    // Find winner player
+    const winnerPlayer = this.room.players.find((p) => p.id === client.id);
+
+    if (!winnerPlayer) return;
 
     this.server.to(this.ROOM).emit('gameCompleted', {
-      winner: client.id,
+      winnerId: client.id,
+      winnerName: winnerPlayer.name, // ✅ added
       joker: this.room.suspenseJoker,
+      screenshot: data?.screenshot || null,
     });
 
     this.room.gameStarted = false;
   }
+  /* ================= RESET ================= */
 
-  // ================= HELPERS =================
+  @SubscribeMessage('restartServer')
+  restartServer(@ConnectedSocket() client: Socket) {
+    if (client.id !== this.room.hostId) return;
+
+    this.server.to(this.ROOM).emit('serverRestarted');
+    this.resetEntireRoom();
+  }
+
+  /* ================= HELPERS ================= */
+
   private getCurrent() {
     return this.room.players[this.room.currentTurnIndex];
   }
@@ -234,6 +272,8 @@ export class GameGateway {
   }
 
   private getState() {
+    const current = this.getCurrent();
+
     return {
       players: this.room.players,
       hostId: this.room.hostId,
@@ -241,18 +281,35 @@ export class GameGateway {
       openCard: this.room.openPile[this.room.openPile.length - 1],
       deckCount: this.room.deck.length,
       gameStarted: this.room.gameStarted,
+      currentPlayerName: current?.name,
+    };
+  }
+
+  private resetEntireRoom() {
+    this.room = {
+      players: [],
+      hostId: null,
+      deck: [],
+      openPile: [],
+      currentTurnIndex: 0,
+      gameStarted: false,
+      suspenseJoker: null,
+      pendingRummy: null,
+      jokerUnlockedBy: null,
     };
   }
 
   private reshuffle() {
     const top = this.room.openPile.pop();
+    if (!top) return;
+
     this.room.deck = [...this.room.openPile];
     this.shuffle(this.room.deck);
-    this.room.openPile = [top!];
+    this.room.openPile = [top];
   }
 
-  private createDeck() {
-    const suits = ['♠', '♥', '♦', '♣'];
+  private createDeck(): Card[] {
+    const suits = ['♤', '♥', '♦', '♧'];
     const values = [
       'A',
       '2',
@@ -268,33 +325,42 @@ export class GameGateway {
       'Q',
       'K',
     ];
-    const singleDeck = suits.flatMap((s) => values.map((v) => v + s));
 
-    return [...singleDeck, ...singleDeck, ...singleDeck];
-  }
+    const deck: Card[] = [];
 
-  private shuffle(a: string[]) {
-    for (let i = a.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
+    for (let deckNumber = 1; deckNumber <= 3; deckNumber++) {
+      // Normal cards
+      for (const suit of suits) {
+        for (const value of values) {
+          deck.push({
+            id: `${value}${suit}_${deckNumber}`,
+            value,
+            suit,
+          });
+        }
+      }
+
+      // ✅ Add Jokers with symbol
+      deck.push({
+        id: `JOKER_RED_${deckNumber}`,
+        value: '🃏',
+        suit: '',
+      });
+
+      deck.push({
+        id: `JOKER_BLACK_${deckNumber}`,
+        value: '🃏',
+        suit: '',
+      });
     }
+
+    return deck;
   }
 
-  private validateSequence(cards: string[]) {
-    const suit = cards[0].slice(-1);
-    const map: any = { A: 1, J: 11, Q: 12, K: 13 };
-
-    const nums = cards.map((c) => {
-      if (c.slice(-1) !== suit) return -1;
-      const v = c.slice(0, -1);
-      return map[v] || parseInt(v);
-    });
-
-    if (nums.includes(-1)) return false;
-    nums.sort((a, b) => a - b);
-    for (let i = 1; i < nums.length; i++)
-      if (nums[i] !== nums[i - 1] + 1) return false;
-
-    return true;
+  private shuffle(array: Card[]) {
+    for (let i = array.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [array[i], array[j]] = [array[j], array[i]];
+    }
   }
 }
